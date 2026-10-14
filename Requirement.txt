@@ -1,0 +1,221 @@
+# Take-Home Assignment - Tenant Provisioning Control Plane
+
+## Context & Scenario
+
+You are joining the platform team of a multi-tenant SaaS company. Tenants are
+provisioned asynchronously: when a customer signs up, the control plane records the
+tenant and emits an event. Worker processes pick up the event, do the actual
+provisioning (which can take minutes), and report progress back through a message
+queue.
+
+Your job: **build the control-plane service from scratch**, publish it to a **public
+GitHub repository**, and send us the link.
+
+There is no starter code. The API contract below is the spec.
+
+## What you are building
+
+One deployable unit, bootable with a single command, containing:
+
+1. **The control-plane service**: the HTTP API + message consumer described below.
+   This is the star of the show; most of your effort goes here.
+2. **A worker simulator**: a separate process (a small CLI/script is fine; it does
+   not need its own HTTP API) that consumes the tasks published by the control
+   plane and simulates the provisioning work, publishing progress back onto the
+   broker as it moves through `in_progress`, then `done` or `failed`. The
+   message schema for these updates is yours to design; whatever you choose
+   must carry a stable identifier suitable as an idempotency key and a clear
+   reference to the task it updates.
+
+   Timing and outcome are configurable via entry params (CLI args / env vars,
+   e.g. `--fail-rate`, `--min-delay-ms`, `--max-delay-ms`) at process startup,
+   so failure and delay scenarios can be triggered by restarting the worker
+   with different arguments.
+
+---
+
+## Functional Requirements
+
+### Domain model
+
+**Tenant**: a customer environment, mutated through tasks.
+
+| Field                       | Rules                                                                                                                                                                                                                                 |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                        | Server-generated                                                                                                                                                                                                                      |
+| `slug`                      | 3-28 chars, `^[a-z][-a-z0-9]{1,26}[a-z0-9]$` (k8s-namespace compatible), unique, including against `destroyed` tenants; concurrent creates with the same slug must yield exactly one success, the loser gets `tenant_already_exists` |
+| `name`                      | Non-empty                                                                                                                                                                                                                             |
+| `status`                    | State machine, see below                                                                                                                                                                                                              |
+| `version`                   | Integer, incremented on every mutation, including worker-applied status changes (optimistic locking)                                                                                                                                  |
+| `created_at` / `updated_at` | ISO 8601, milliseconds, `Z` suffix                                                                                                                                                                                                    |
+
+**Task**: an asynchronous operation on a tenant; the unit that flows through
+the broker. A task _is_ the published event, persisted.
+
+| Field                       | Rules                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| `id`                        | Server-generated; doubles as the event `id`                                    |
+| `type`                      | `deploy` \| `update` \| `destroy`                                              |
+| `tenant_id`                 | The tenant it operates on                                                      |
+| `status`                    | `accepted` → `in_progress` → `done` \| `failed` (`done`/`failed` are terminal) |
+| `created_at` / `updated_at` | ISO 8601, milliseconds, `Z` suffix                                             |
+
+Tasks are created only as a side effect of a tenant API call. At most one
+**open** task (`accepted` or `in_progress`) exists per tenant; this falls out
+of the tenant status guards below, not from a separate lock.
+
+### State machines
+
+The tenant and the task each have a small state machine. Tasks are driven by
+the worker; tenants are driven by API calls and by terminal task outcomes.
+
+Task:
+
+```mermaid
+stateDiagram-v2
+    accepted --> in_progress : result
+    in_progress --> done : result
+    in_progress --> failed : result
+```
+
+Tenant:
+
+```mermaid
+stateDiagram-v2
+    provisioning --> active : deploy done
+    provisioning --> failed : deploy failed
+    active --> updating : PATCH
+    updating --> active : update done
+    updating --> failed : update failed
+    active --> destroying : DELETE
+    destroying --> destroyed : destroy done
+    destroying --> failed : destroy failed
+    failed --> destroying : DELETE
+```
+
+The prose below is authoritative; the diagrams are just renderings of it.
+
+- Creating a tenant → tenant `provisioning`, creates a `deploy` task (`accepted`), publishes it.
+- The worker reports task progress via the queue: `in_progress`, then `done` or `failed`.
+  A **terminal** task outcome moves the tenant: `deploy done` → `active`,
+  `update done` → `active`, `destroy done` → `destroyed`; any `failed` outcome → `failed`.
+  Tenant `failed` is therefore reachable from `provisioning`, `updating`, and `destroying`.
+- Updating a tenant (only from `active`) → tenant `updating`, creates an `update` task.
+- Deleting a tenant (only from `active` or `failed`) → tenant `destroying`, creates a `destroy` task.
+- API to track tasks exists.
+
+### HTTP API
+
+Expose a **RESTful API** with full **CRUD** coverage for tenants
+and read-only access to tasks:
+
+- **Tenants**: create, list, get, update (partial), and delete. Every mutating
+  call must obey the state machine and guards above, including the
+  `version`-based optimistic locking on update, and the structured errors
+  (`tenant_not_found`, `tenant_already_exists`, `tenant_update_not_allowed`,
+  `tenant_version_conflict`) on the relevant operations.
+- **Tasks**: list and get only. Tasks are read-only over HTTP; they are
+  created and driven exclusively through the tenant endpoints and the worker.
+
+Route naming, pagination, and filtering conventions are yours to design;
+follow conventional REST semantics (HTTP methods and status codes that match
+the operation, unambiguous resource-oriented paths, not verbs or overloaded
+query params standing in for a resource) and keep them consistent and
+documented.
+
+### Errors
+
+All errors must return a structured, machine-readable body, not a bare
+string or a stack trace, so a client can branch on the failure. Choose HTTP
+statuses that fit each error's semantics and keep the mapping consistent and
+documented; the exact body shape and status codes are your call.
+
+The error codes themselves are a contract: `tenant_not_found`,
+`tenant_already_exists`, `tenant_update_not_allowed`, `tenant_version_conflict`,
+`task_not_found`.
+
+### Messaging
+
+The control plane and the worker talk to each other over the broker in both
+directions: tasks flow out to the worker as they're created, and progress
+flows back in as the worker processes them. The message schema in each
+direction (topic/queue names, envelope fields, etc.) is yours to design; the
+requirements below are behavioral, not a wire format.
+
+- **Outbound**: every state-changing API call writes the tenant and its new
+  task, then publishes exactly one event **after the write is durably
+  committed**, never before, never on rollback. The task _is_ the event: a
+  consumer must be able to recover the task's `id`, `type`, `tenant_id`, and
+  `status` from it.
+- **Inbound**: consume the worker's progress updates and apply them to the
+  task, and, on a terminal outcome, to the tenant. Each update must carry a
+  stable identifier that serves as the idempotency key. The consumer must be:
+  - **Idempotent**: the same update delivered twice changes nothing and fails nothing.
+  - **Order-tolerant**: a stale update (e.g. `in_progress` arriving after `done`,
+    or any update for a terminal task) must not regress state.
+  - **Resilient**: transient broker failures are retried with backoff; poison
+    messages must not kill the consumer.
+
+---
+
+## Non-Functional Requirements
+
+1. **Concurrency correctness**: two simultaneous `PATCH`es with the same
+   `version` must not both succeed.
+2. **Persistence**: tenants survive a restart.
+3. **Language & stack**: **Go**. Frameworks, libraries, and
+   broker are entirely up to you, as long as everything runs locally in containers.
+4. **Quality gates**: your repo should include, wired into a single documented command:
+   - static analysis / linting appropriate to the language,
+   - a formatter (all code must be formatted),
+   - a security scanner, (nice to have)
+   - an automated test suite with meaningful coverage of the state machine, the
+     concurrency rules, and the messaging behavior.
+5. **Docs**: `README.md` with: architecture overview (a diagram is a plus), design
+   decisions and trade-offs, API usage examples, and setup instructions.
+6. **No secrets** in the repo, ever.
+
+## Setup Guide (what we will do)
+
+We should be able to run exactly this, cold, using whatever command runner you
+pick; pick one
+and document the exact commands in your README, since we will copy-paste them
+rather than guess:
+
+```bash
+git clone <your-repo> && cd <your-repo>
+<your boot command>    # single command: builds & boots everything
+<your test command>    # single command: runs the full suite
+```
+
+After boot, creating a tenant via the API must walk the full lifecycle with
+no manual steps; the worker simulator drives the deploy task `accepted` →
+`in_progress` → `done` and the tenant `provisioning` → `active`, all observable
+via the tenant detail and task list endpoints. Negative scenarios (failures,
+duplicates, out-of-order deliveries) must be reproducible by restarting the
+worker with different CLI args/env vars (e.g. `--fail-rate=1`) and/or by
+publishing messages directly to the broker (a documented script or CLI
+snippet using the broker's own tooling is enough); document both with
+example commands in the README.
+
+Any broker, database, or other dependency must come up as part of that single
+boot command and run locally.
+
+## Rules
+
+- **Time**: this is deliberately larger than a typical 2-3 hour exercise. Don't
+  gold-plate; prioritize correctness of the state machine, concurrency, and messaging
+  over breadth.
+- **AI assistants are allowed and expected.** We assume you will use them; the scope
+  is sized accordingly. We will ask you to walk us through the code live, so make sure
+  you can explain every line and every trade-off as if you wrote it unaided.
+- Any third-party library is permitted.
+- Publish on GitHub as a public repo with a clean commit history.
+
+## Tips
+
+- Publishing an event _before_ the DB commit is a classic bug. Think about ordering.
+- "Exactly-once delivery" doesn't exist. Design for at-least-once.
+- A small in-repo load/concurrency test (even a script) that demonstrates the race
+  conditions are handled says more than any claim in the README.
+- We value boring, correct, well-tested code over cleverness.

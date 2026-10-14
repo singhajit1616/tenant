@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Boot application from checkout
+        run: docker compose up --build -d
+      - name: Verify deployed HTTP lifecycle and races
+        run: python3 scripts/smoke.py
+      - name: Run quality gates
+        run: docker compose --profile test run --rm --build test
+      - name: Container logs
+        if: failure()
+        run: docker compose --profile test logs --no-color
+      - name: Stop containers
+        if: always()
+        run: docker compose --profile test down -v
